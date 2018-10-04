@@ -1,58 +1,36 @@
 use std::io;
-use std::str;
-use serde_json;
-use uuid::Uuid;
-use std::net::SocketAddr;
+use bytes::BytesMut;
 use tokio::codec::{Encoder, Decoder};
-use bytes::{BufMut, BytesMut};
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub enum Msg {
-    Ping((Uuid, SocketAddr)),
-    Pong((Uuid, SocketAddr)),
-    Payload(String),
-    PeerAddresses(Vec<(Uuid, SocketAddr)>),
-}
 
-pub struct MsgCodec; // json line
 
-impl Decoder for MsgCodec {
-    type Item = Msg;
+#[derive(Debug)]
+pub struct TestBytes;// {
+
+impl Decoder for TestBytes {
+    type Item = Vec<u8>;
     type Error = io::Error;
 
-    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Self::Item>> {
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if let Some(i) = buf.iter().position(|&b| b == b'\n') {
             // Remove the serialized frame from the buffer.
-            let line = buf.split_to(i);
-            // Remove the '\n'.
-            buf.split_to(1);
-            // Turn the line into a UTF string.
-            let s = str::from_utf8(&line)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            // Parse into json.
-            serde_json::from_str(&s)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            let line = buf.split_to(i + 1);
+            Ok(Some(line.to_vec()))
         } else {
             Ok(None)
         }
     }
 }
 
-impl Encoder for MsgCodec {
-    type Item = Msg;
+impl Encoder for TestBytes {
+    type Item = Vec<u8>;
     type Error = io::Error;
 
-    fn encode(&mut self, msg: Msg, buf: &mut BytesMut)
-              -> io::Result<()> {
-        let json_msg = serde_json::to_string(&msg)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        // String implements IntoBuf, a trait used by the `bytes` API to work with
-        // types that can be expressed as a sequence of bytes.
-        buf.put(json_msg);
-        // Put the '\n' in the buffer.
-        buf.put_u8(b'\n');
-        // Return ok to signal that no error occured.
+    fn encode(&mut self, chunk: Self::Item, buf: &mut BytesMut) -> Result<(), io::Error> {
+        use bytes::BufMut;
+
+        buf.reserve(chunk.len() + 1);
+        buf.put(chunk);
         Ok(())
     }
 }
-
