@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use std::net::AddrParseError;
+use node::Tx;
 
 pub enum State {
     Connected,
@@ -11,7 +12,7 @@ pub enum State {
 #[derive(Clone)]
 pub struct Peer {
     pub info: PeerInfo,
-    state: Arc<RwLock<State>>,
+    pub peers: HashMap<String, (Tx, SocketAddr)>,
 }
 
 impl Peer {
@@ -20,9 +21,8 @@ impl Peer {
             info: PeerInfo {
                 id: addr.clone(),
                 addr: addr.parse()?,
-                peers: HashMap::new(),
             },
-            state: Arc::new(RwLock::new(State::Disconnected)),
+            peers: HashMap::new(),
         })
     }
 }
@@ -31,8 +31,6 @@ impl Peer {
 pub struct PeerInfo {
     pub id: String,
     pub addr: SocketAddr,
-    // todo peers should have a handle to the handler of the peer?
-    pub peers: HashMap<String, SocketAddr>,
 }
 
 

@@ -20,11 +20,11 @@ fn main() {
     };
 
     let peer_str = matches.opt_str("p").unwrap_or("".to_owned());
-    let peer_tokens: Vec<&str> = peer_str.split(",").collect() ;
-    let peers = peer_tokens.into_iter().map(|p| p.parse().unwrap());
-    println!("Peers => {:?}", peers);
+    let peer_tokens = peer_str.split(",").collect() ;
+//    let peers: Vec<SocketAddr> = peer_tokens.into_iter().map(|p| p.parse().unwrap()).collect();
+//    println!("Peers => {:?}", peers);
 
     let add = matches.opt_str("a").unwrap_or("127.0.0.1:21337".to_owned());
     let node = Node::new(add).unwrap();
-    node.run(peers)
+    node.run(peer_tokens)
 }
