@@ -13,8 +13,6 @@ use codec::TestBytes;
 use serde_json;
 use std::sync::RwLock;
 use std::thread;
-use tokio::runtime::current_thread::Runtime;
-use tokio::runtime::current_thread::Handle;
 
 #[derive(Clone)]
 pub struct Node {
@@ -29,7 +27,7 @@ impl Node {
         })
     }
 
-    pub fn serve(peer: Arc<RwLock<Peer>>, handle: Handle) -> Box<Future<Item=(), Error=io::Error> + Send> {
+    pub fn serve(peer: Arc<RwLock<Peer>>) -> Box<Future<Item=(), Error=io::Error> + Send> {
         let info = peer.read().unwrap().info.clone();
         println!("starting node {}", &info.id);
 
@@ -52,28 +50,27 @@ impl Node {
                 let peer = peer.clone();
 
 
-                let h = handle.clone();
                 // read from the split socket
                 let read = reader.for_each(move |frame| {
-                    Node::process(frame, tx.clone(), peer.clone(), h.clone());
+                    Node::process(frame, tx.clone(), peer.clone());
                     Ok(())
                 }).map_err(|e| eprintln!("Error: {:?}", e));
                 // spawn a tokio thread for read
-                handle.spawn(read).unwrap();
+                tokio::spawn(read);
 
                 // write to the stream part of the split socket by reading from the receiver part of the mpsc
                 let write = writer.send_all(rx.map_err(|_| {
                     io::Error::new(io::ErrorKind::Other, "rx shouldn't have an error")
                 })).then(|_| Ok(()));
                 // spawn tokio thread for write
-                handle.spawn(write).unwrap();
+                tokio::spawn(write);
 
                 Ok(())
             });
         Box::new(server)
     }
 
-    pub fn client(peer: Arc<RwLock<Peer>>, addr: SocketAddr, handle: Handle) -> Box<Future<Item=(), Error=io::Error> + Send> {
+    pub fn client(peer: Arc<RwLock<Peer>>, addr: SocketAddr) -> Box<Future<Item=(), Error=io::Error> + Send> {
         let socket = TcpStream::connect(&addr);
         let client = socket.and_then(move |socket| {
             println!("{} connected to peer {}", socket.local_addr().unwrap(), socket.peer_addr().unwrap());
@@ -87,49 +84,43 @@ impl Node {
                 peer.peers.insert(addr.to_string(), (tx.clone(), addr));
             }).unwrap();
 
-            let h = handle.clone();
             // read from the split socket
             let read = reader.for_each(move |frame| {
-                Node::process(frame, tx.clone(), peer.clone(), h.clone());
+                Node::process(frame, tx.clone(), peer.clone());
                 Ok(())
             }).map_err(|e| eprintln!("Error: {:?}", e));
             // spawn a tokio thread for read
-            handle.spawn(read).unwrap();
+            tokio::spawn(read);
 
             // write to the stream part of the split socket by reading from the receiver part of the mpsc
             let write = writer.send_all(rx.map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "rx shouldn't have an error")
             })).then(|_| Ok(()));
             // spawn tokio thread for write
-            handle.spawn(write).unwrap();
+            tokio::spawn(write);
 
             Ok(())
         });
         Box::new(client)
     }
 
+    pub fn spawn_peer(peer:Arc<RwLock<Peer>>, addr: SocketAddr) {
+        thread::spawn(move || {
+            let client = Node::client(peer, addr);
+            tokio::run(client.map_err(|e| eprintln!("client error = {:?}", e)));
+        });
+    }
+
     pub fn run(&self, addrs: Vec<&str>) {
 
         let peer = self.peer.clone();
-        let mut runtime = Runtime::new().unwrap();
-        let handle = runtime.handle();
-        let server = Node::serve(peer.clone(), handle.clone());
+        let server = Node::serve(peer.clone());
 
-
-
-        addrs.iter().flat_map(|s| s.parse()).for_each(|addr: SocketAddr| {
-            println!("connecting to client {}", addr.to_string());
-            let peer = self.peer.clone();
-            let client = Node::client(peer, addr, handle.clone());
-            let handle2 = handle.clone();
-                handle2.spawn(client.map_err(|e| println!("client error = {:?}", e))).unwrap();
+        addrs.iter().flat_map(|s| s.parse()).for_each(|addr|{
+            Node::spawn_peer(peer.clone(), addr);
         });
 
-        thread::spawn(move || {
-            handle.spawn(server.map_err(|e| println!("server error = {:?}", e))).unwrap();
-        }).join().unwrap();
-
-        runtime.run().unwrap()
+        tokio::run(server.map_err(|e| eprintln!("Error spawning server {:?}", e)));
     }
 
     fn decode(frame: &[u8]) -> Msg {
@@ -151,7 +142,7 @@ impl Node {
         }).unwrap();
     }
 
-    pub fn process(frame: Vec<u8>, tx: Tx, peer: Arc<RwLock<Peer>>, handle: Handle) {
+    pub fn process(frame: Vec<u8>, tx: Tx, peer: Arc<RwLock<Peer>>) {
         // this should bo done with flat buffers but for testing serde is good
         match Node::decode(&frame) {
             Msg::Payload(m) => {
@@ -178,10 +169,7 @@ impl Node {
                     // checks that we don't open a new client to the current node or a node already in peers
                     println!("about to check peers {}", &s);
                     if s != &id && peer.read().unwrap().peers.get(s).is_none() {
-                        println!("openin conn");
-                        handle.spawn(
-                                Node::client(peer.clone(), socket_addr.clone(), handle.clone())
-                                    .map_err(|e| println!("error spawning client {:?}", e))).unwrap();
+                        Node::spawn_peer(peer.clone(), socket_addr.clone());
                     }
                 });
             }
