@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use std::net::AddrParseError;
 use node::Tx;
@@ -13,6 +12,8 @@ pub enum State {
 pub struct Peer {
     pub info: PeerInfo,
     pub peers: HashMap<String, (Tx, SocketAddr)>,
+    pub broadcasting_peers: HashMap<String, (Tx, SocketAddr)>,
+    pub known_peers: HashMap<String, SocketAddr>,
 }
 
 impl Peer {
@@ -23,6 +24,8 @@ impl Peer {
                 addr: addr.parse()?,
             },
             peers: HashMap::new(),
+            broadcasting_peers: HashMap::new(),
+            known_peers: HashMap::new(),
         })
     }
 }
@@ -34,6 +37,3 @@ pub struct PeerInfo {
 }
 
 
-pub struct Peers {
-    peers: RwLock<HashMap<SocketAddr, Arc<RwLock<Peer>>>>,
-}

@@ -4,17 +4,17 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use peer::{Peer, PeerInfo, State};
-use std::collections::HashMap;
+use peer::Peer;
 use std::net::AddrParseError;
 use futures::sync::mpsc;
 use futures::{Stream, Sink};
 use tokio_codec::Decoder;
 use codec::TestBytes;
-use futures::sync::mpsc::{channel, Sender, Receiver};
-use futures::future::join_all;
 use serde_json;
 use std::sync::RwLock;
+use std::thread;
+use tokio::runtime::current_thread::Runtime;
+use tokio::runtime::current_thread::Handle;
 
 #[derive(Clone)]
 pub struct Node {
@@ -29,8 +29,9 @@ impl Node {
         })
     }
 
-    pub fn serve(peer: Arc<RwLock<Peer>>) -> Box<Future<Item=(), Error=io::Error> + Send> {
+    pub fn serve(peer: Arc<RwLock<Peer>>, handle: Handle) -> Box<Future<Item=(), Error=io::Error> + Send> {
         let info = peer.read().unwrap().info.clone();
+        println!("starting node {}", &info.id);
 
         let socket = TcpListener::bind(&info.addr).unwrap();
         let server = socket.incoming()
@@ -51,54 +52,56 @@ impl Node {
                 let peer = peer.clone();
 
 
+                let h = handle.clone();
                 // read from the split socket
                 let read = reader.for_each(move |frame| {
-                    Node::process(frame, tx.clone(), peer.clone());
+                    Node::process(frame, tx.clone(), peer.clone(), h.clone());
                     Ok(())
                 }).map_err(|e| eprintln!("Error: {:?}", e));
                 // spawn a tokio thread for read
-                tokio::spawn(read);
+                handle.spawn(read).unwrap();
 
                 // write to the stream part of the split socket by reading from the receiver part of the mpsc
                 let write = writer.send_all(rx.map_err(|_| {
                     io::Error::new(io::ErrorKind::Other, "rx shouldn't have an error")
                 })).then(|_| Ok(()));
                 // spawn tokio thread for write
-                tokio::spawn(write);
+                handle.spawn(write).unwrap();
 
                 Ok(())
             });
         Box::new(server)
     }
 
-    pub fn client(peer: Arc<RwLock<Peer>>, addr: SocketAddr) -> Box<Future<Item=(), Error=io::Error> + Send> {
+    pub fn client(peer: Arc<RwLock<Peer>>, addr: SocketAddr, handle: Handle) -> Box<Future<Item=(), Error=io::Error> + Send> {
         let socket = TcpStream::connect(&addr);
         let client = socket.and_then(move |socket| {
             println!("{} connected to peer {}", socket.local_addr().unwrap(), socket.peer_addr().unwrap());
             let (writer, reader) = TestBytes.framed(socket).split();
             let (tx, rx) = mpsc::unbounded();
 
-            // send ping
-            mpsc::UnboundedSender::unbounded_send(&tx, Node::serde_encode(&Msg::Ping((peer.read().unwrap().info.id.clone(), peer.read().unwrap().info.addr)))).expect("Failed to send message");
+            // send ping when connection opens
+            mpsc::UnboundedSender::unbounded_send(&tx, Node::encode(&Msg::Ping((peer.read().unwrap().info.id.clone(), peer.read().unwrap().info.addr)))).expect("Failed to send message");
 
             peer.write().map(|mut peer| {
                 peer.peers.insert(addr.to_string(), (tx.clone(), addr));
             }).unwrap();
 
+            let h = handle.clone();
             // read from the split socket
             let read = reader.for_each(move |frame| {
-                Node::process(frame, tx.clone(), peer.clone());
+                Node::process(frame, tx.clone(), peer.clone(), h.clone());
                 Ok(())
             }).map_err(|e| eprintln!("Error: {:?}", e));
             // spawn a tokio thread for read
-            tokio::spawn(read);
+            handle.spawn(read).unwrap();
 
             // write to the stream part of the split socket by reading from the receiver part of the mpsc
             let write = writer.send_all(rx.map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "rx shouldn't have an error")
             })).then(|_| Ok(()));
             // spawn tokio thread for write
-            tokio::spawn(write);
+            handle.spawn(write).unwrap();
 
             Ok(())
         });
@@ -106,53 +109,89 @@ impl Node {
     }
 
     pub fn run(&self, addrs: Vec<&str>) {
-        println!("starting node");
-        let peer = self.peer.clone();
-        let server = Node::serve(peer.clone());
 
-        let mut futures = vec![server];
+        let peer = self.peer.clone();
+        let mut runtime = Runtime::new().unwrap();
+        let handle = runtime.handle();
+        let server = Node::serve(peer.clone(), handle.clone());
+
+
 
         addrs.iter().flat_map(|s| s.parse()).for_each(|addr: SocketAddr| {
             println!("connecting to client {}", addr.to_string());
             let peer = self.peer.clone();
-            let client = Node::client(peer, addr);
-
-            futures.push(client);
+            let client = Node::client(peer, addr, handle.clone());
+            let handle2 = handle.clone();
+                handle2.spawn(client.map_err(|e| println!("client error = {:?}", e))).unwrap();
         });
-        let joined_futures = join_all(futures);
 
-        tokio::run(joined_futures.then(|_| {
-            println!("ending");
-            Ok(())
-        }));
+        thread::spawn(move || {
+            handle.spawn(server.map_err(|e| println!("server error = {:?}", e))).unwrap();
+        }).join().unwrap();
+
+        runtime.run().unwrap()
     }
 
-    fn serde_decode(frame: &[u8]) -> Msg {
+    fn decode(frame: &[u8]) -> Msg {
         let s = String::from_utf8(frame.to_vec()).unwrap();
         serde_json::from_str(&s).unwrap()
     }
 
-    fn serde_encode(msg: &Msg) -> Vec<u8> {
+    fn encode(msg: &Msg) -> Vec<u8> {
         let mut s = serde_json::to_string(msg).unwrap().as_bytes().to_vec();
         s.push(b'\n');
         s
     }
 
-    pub fn process(frame: Vec<u8>, tx: Tx, peer: Arc<RwLock<Peer>>) {
+    fn add_peer(id: String, tx: Tx, socket_addr: SocketAddr, peer: Arc<RwLock<Peer>>) {
+        println!("Adding peer {}", &id);
+        peer.write().map(|mut peer| {
+            peer.peers.insert(id, (tx, socket_addr));
+            println!("updated peers {:?}", &peer.peers.keys());
+        }).unwrap();
+    }
+
+    pub fn process(frame: Vec<u8>, tx: Tx, peer: Arc<RwLock<Peer>>, handle: Handle) {
         // this should bo done with flat buffers but for testing serde is good
-        match Node::serde_decode(&frame) {
+        match Node::decode(&frame) {
             Msg::Payload(m) => {
                 println!("payload => {}", m);
-                mpsc::UnboundedSender::unbounded_send(&tx, Node::serde_encode(&Msg::Payload(format!("got {}", m)))).expect("Failed to send message");
+                mpsc::UnboundedSender::unbounded_send(&tx, Node::encode(&Msg::Payload(format!("got {}", m)))).expect("Failed to send message");
             }
-            Msg::Ping(m) => {
-                println!("ping {:?}", m);
-                mpsc::UnboundedSender::unbounded_send(&tx, Node::serde_encode(&Msg::Pong((peer.read().unwrap().info.id.clone(), peer.read().unwrap().info.addr)))).expect("Failed to send message");
+            // client sends ping on first connection (this message is received by the server)
+            Msg::Ping((id, _socket_addr)) => {
+                println!("got ping from {:?}", id);
+                mpsc::UnboundedSender::unbounded_send(&tx, Node::encode(&Msg::Pong((peer.read().unwrap().info.id.clone(), peer.read().unwrap().info.addr)))).expect("Failed to send ping");
+                // TODO add it to known connections used for broadcasting
             }
-            Msg::Pong(m) => {
-                println!("pong");
+            // server responds to ping (message received by the client)
+            Msg::Pong((id, socket_addr)) => {
+                println!("got pong from {}", id);
+                Node::add_peer(id, tx.clone(), socket_addr, peer);
+                mpsc::UnboundedSender::unbounded_send(&tx, Node::encode(&Msg::GetPeers)).expect("Failed to ask for peers");
             }
-            _ => println!("unknown message")
+            Msg::AddrVec(addr) => {
+                println!("got peers {:?}", addr);
+                let id = peer.read().unwrap().info.id.clone();
+                // TODO when node already has 8 peers connected store the socket in another list
+                addr.iter().for_each(|(s, socket_addr)| {
+                    // checks that we don't open a new client to the current node or a node already in peers
+                    println!("about to check peers {}", &s);
+                    if s != &id && peer.read().unwrap().peers.get(s).is_none() {
+                        println!("openin conn");
+                        handle.spawn(
+                                Node::client(peer.clone(), socket_addr.clone(), handle.clone())
+                                    .map_err(|e| println!("error spawning client {:?}", e))).unwrap();
+                    }
+                });
+            }
+            Msg::GetPeers => {
+                println!("got peer request");
+                let peers = peer.read().unwrap().peers.iter().map(|(id, (_, socket))| {
+                    (id.to_owned(), socket.clone())
+                }).collect::<Vec<_>>();
+                mpsc::UnboundedSender::unbounded_send(&tx, Node::encode(&Msg::AddrVec(peers))).expect("Failed to send peers");
+            }
         }
     }
 }
@@ -165,4 +204,5 @@ pub enum Msg {
     Pong((String, SocketAddr)),
     Payload(String),
     AddrVec(Vec<(String, SocketAddr)>),
+    GetPeers,
 }
